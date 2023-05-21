@@ -1,16 +1,17 @@
 package com.vivek.kafka.streams.processor;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.confluent.kafka.streams.serdes.avro.SpecificAvroSerde;
-import org.apache.avro.Schema;
-import org.apache.avro.specific.SpecificRecord;
+import org.apache.kafka.common.serialization.Deserializer;
 import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.common.serialization.Serializer;
 import org.apache.kafka.streams.KafkaStreams;
 import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.Topology;
 import org.apache.kafka.streams.errors.StreamsException;
+import org.apache.kafka.streams.kstream.Consumed;
 import org.apache.kafka.streams.processor.PunctuationType;
 import org.apache.kafka.streams.processor.api.Processor;
 import org.apache.kafka.streams.processor.api.ProcessorContext;
@@ -22,10 +23,11 @@ import org.apache.kafka.streams.state.StoreBuilder;
 import org.apache.kafka.streams.state.Stores;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.*;
 
-public class EventStoreApp {
+public class EventStore {
     public static void main(String[] args) {
         // Properties
         Properties properties = new Properties();
@@ -34,7 +36,7 @@ public class EventStoreApp {
         properties.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass().getName());
         properties.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass().getName());
 
-        EventStoreApp storeApp = new EventStoreApp();
+        EventStore storeApp = new EventStore();
         KafkaStreams streams = new KafkaStreams(storeApp.createTopology(), properties);
         streams.cleanUp();
         streams.start();
@@ -56,7 +58,7 @@ public class EventStoreApp {
         // Add more topics and corresponding stores as needed
 
         // Create a map to hold the store builders
-        Map<String, StoreBuilder<KeyValueStore<String, StoreEvent>>> storeBuilders = new HashMap<>();
+        Map<String, StoreBuilder<KeyValueStore<String, EventStore.StoreEvent>>> storeBuilders = new HashMap<>();
 
         // Add sources and processors for each topic
         for (String topic : topicStoreMap.keySet()) {
@@ -67,25 +69,61 @@ public class EventStoreApp {
                 storeBuilders.put(storeName, createKeyValueStoreBuilder(storeName));
             }
 
-            topology.addSource(topic, topic)
-                    .addProcessor(storeName, new StoreProcessorSupplier(storeName, new JsonPathKeyExtractor("$.key")), topic)
-                    .addStateStore(storeBuilders.get(storeName), storeName)
-                    .addSink(storeName + "Sink", storeName, "outputTopic");
+            // Create a new instance of the ProcessorSupplier for each topic
+            StoreProcessorSupplier processorSupplier =
+                    new StoreProcessorSupplier(storeName, new JsonPathKeyExtractor("/key"));
+
+            // Add the source processor for the topic
+            topology.addSource("Source-" + topic, String.valueOf(Consumed.with(Serdes.String(), Serdes.String())), topic);
+
+            // Add the processor and sink for the topic
+            topology.addProcessor("Processor-" + storeName, processorSupplier, "Source-" + topic)
+                    .addSink("Sink-" + storeName, "outputTopic", "Processor-" + storeName);
         }
-
         return topology;
+    }
 
+    private static class StoreEventSerializer implements Serializer<StoreEvent> {
+        private final ObjectMapper objectMapper = new ObjectMapper();
+
+        @Override
+        public byte[] serialize(String topic, StoreEvent data) {
+            try {
+                return objectMapper.writeValueAsString(data).getBytes(StandardCharsets.UTF_8);
+            } catch (JsonProcessingException e) {
+                throw new RuntimeException("Error serializing StoreEvent", e);
+            }
+        }
+    }
+
+    private static class StoreEventDeserializer implements Deserializer<StoreEvent> {
+        private final ObjectMapper objectMapper = new ObjectMapper();
+
+        @Override
+        public StoreEvent deserialize(String topic, byte[] data) {
+            try {
+                return objectMapper.readValue(new String(data, StandardCharsets.UTF_8), StoreEvent.class);
+            } catch (IOException e) {
+                throw new RuntimeException("Error deserializing StoreEvent", e);
+            }
+        }
     }
 
     private static StoreBuilder<KeyValueStore<String, StoreEvent>> createKeyValueStoreBuilder(String storeName) {
+
+        Serializer<String> keySerializer = Serdes.String().serializer();
+        Deserializer<String> keyDeserializer = Serdes.String().deserializer();
+        Serializer<StoreEvent> valueSerializer = new StoreEventSerializer();
+        Deserializer<StoreEvent> valueDeserializer = new StoreEventDeserializer();
+
         return Stores.keyValueStoreBuilder(
                 Stores.persistentKeyValueStore(storeName),
-                Serdes.String(),
-                new SpecificAvroSerde<>()
+                Serdes.serdeFrom(keySerializer, keyDeserializer),
+                Serdes.serdeFrom(valueSerializer, valueDeserializer)
         );
     }
 
-    public static class StoreProcessorSupplier implements ProcessorSupplier<String, Event, String, StoreEvent> {
+    public static class StoreProcessorSupplier implements ProcessorSupplier<String, String, String, String> {
 
         private final String storeName;
         private final KeyExtractor keyExtractor;
@@ -94,9 +132,8 @@ public class EventStoreApp {
             this.storeName = storeName;
             this.keyExtractor = keyExtractor;
         }
-
         @Override
-        public Processor<String, Event, String, StoreEvent> get() {
+        public Processor<String, String, String, String> get() {
             return new StoreProcessor(storeName, keyExtractor);
         }
 
@@ -107,7 +144,7 @@ public class EventStoreApp {
         }
     }
 
-    public static class StoreProcessor implements Processor<String, Event, String, StoreEvent> {
+    public static class StoreProcessor implements Processor<String, String, String, String>{
 
         private final String storeName;
         private KeyValueStore<String, StoreEvent> kvStore;
@@ -119,38 +156,60 @@ public class EventStoreApp {
         }
 
         @Override
-        public void init(ProcessorContext<String, StoreEvent> context) {
+        public void init(ProcessorContext<String, String> context) {
             kvStore = context.getStateStore(storeName);
 
             context.schedule(Duration.ofSeconds(1), PunctuationType.STREAM_TIME, timestamp -> {
-                try (final KeyValueIterator<String, StoreEvent> iter = kvStore.all()) {
-                    while (iter.hasNext()) {
-                        final KeyValue<String, StoreEvent> entry = iter.next();
-                        context.forward(new Record<>(entry.key, entry.value, timestamp));
+                try (final KeyValueIterator<String, StoreEvent> iterator = kvStore.all()) {
+                    while (iterator.hasNext()) {
+                        final KeyValue<String, StoreEvent> entry = iterator.next();
+                        context.forward(new Record<>(entry.key, entry.value.toString(), timestamp));
                     }
                 }
             });
         }
 
         @Override
-        public void process(Record<String, Event> record) {
-            String key = keyExtractor.extractKey(record.value().toString());
+        public void process(Record<String, String> record) {
+
+            String jsonRecord = record.value();
+            Event event = null;
+            try {
+                ObjectMapper objectMapper = new ObjectMapper();
+                JsonNode jsonNode = objectMapper.readTree(jsonRecord);
+
+                String key = jsonNode.get("key").asText();
+                String type = jsonNode.get("type").asText();
+                String body = jsonNode.get("body").asText();
+                int version = jsonNode.get("version").asInt();
+
+                event = new Event();
+                event.key = key;
+                event.type = type;
+                event.body = body;
+                event.version = version;
+
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+
+            String key = keyExtractor.extractKey(record.value());
             if (key == null) {
                 throw new StreamsException("Key extraction failed for record: " + record);
             }
 
             StoreEvent oldEvent = kvStore.get(key);
 
-            if (oldEvent == null || oldEvent.after.version == record.timestamp() - 1) {
+
+            if (oldEvent == null || oldEvent.after.version == Objects.requireNonNull(event).version - 1) {
                 StoreEvent newEvent = new StoreEvent();
                 if (oldEvent != null) {
-                    newEvent.before = (oldEvent.after != null ? oldEvent.after : null);
+                    newEvent.before = oldEvent.after;
                 }
-                newEvent.after = record.value();
+                newEvent.after = event;
                 newEvent.timestamp = record.timestamp();
                 kvStore.put(key, newEvent);
             }
-
         }
 
         @Override
@@ -159,11 +218,12 @@ public class EventStoreApp {
         }
     }
 
-    public interface KeyExtractor {
+    public interface KeyExtractor{
         String extractKey(String value);
     }
 
-    public static class JsonPathKeyExtractor implements KeyExtractor {
+    public static class JsonPathKeyExtractor implements KeyExtractor{
+
         private final String jsonPath;
 
         public JsonPathKeyExtractor(String jsonPath) {
@@ -182,24 +242,10 @@ public class EventStoreApp {
         }
     }
 
-    public static class StoreEvent implements SpecificRecord {
+    public static class StoreEvent {
         public Event before;
         public Event after;
         public long timestamp;
-
-        @Override
-        public void put(int i, Object v) {
-        }
-
-        @Override
-        public Object get(int i) {
-            return null;
-        }
-
-        @Override
-        public Schema getSchema() {
-            return null;
-        }
     }
 
     public static class Event {
