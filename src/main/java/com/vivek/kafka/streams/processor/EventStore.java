@@ -26,6 +26,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.*;
+import java.util.regex.Pattern;
 
 public class EventStore {
     public static void main(String[] args) {
@@ -37,11 +38,11 @@ public class EventStore {
         properties.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass().getName());
 
         EventStore storeApp = new EventStore();
-        KafkaStreams streams = new KafkaStreams(storeApp.createTopology(), properties);
+        KafkaStreams streams = new KafkaStreams(storeApp.createTopology2(), properties);
         streams.cleanUp();
         streams.start();
 
-        Topology describeTopology = storeApp.createTopology();
+        Topology describeTopology = storeApp.createTopology2();
         System.out.println(describeTopology.describe());
 
         // shutdown hook to correctly close the streams application
@@ -82,6 +83,32 @@ public class EventStore {
         }
         return topology;
     }
+
+    public Topology createTopology2(){
+        Topology topology = new Topology();
+
+        // Create a map to hold the store builders
+        Map<String, StoreBuilder<KeyValueStore<String, EventStore.StoreEvent>>> storeBuilders = new HashMap<>();
+
+        Pattern pattern = Pattern.compile("foo_*");
+
+        topology.addSource("SourceProcessor", pattern);
+
+        String storeName = pattern.toString();
+
+        // Check if the store builder already exists
+        storeBuilders.put(storeName, createKeyValueStoreBuilder(storeName));
+
+        // Create a new instance of the ProcessorSupplier for each topic
+        StoreProcessorSupplier processorSupplier =
+                new StoreProcessorSupplier(storeName, new JsonPathKeyExtractor("/key"));
+
+        topology.addProcessor("FooProcessor", processorSupplier, "SourceProcessor")
+                .addSink("SinkProcessor", "output-topic", "FooProcessor");
+
+        return topology;
+    }
+
 
     private static class StoreEventSerializer implements Serializer<StoreEvent> {
         private final ObjectMapper objectMapper = new ObjectMapper();

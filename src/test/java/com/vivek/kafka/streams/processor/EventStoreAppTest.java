@@ -33,7 +33,7 @@ public class EventStoreAppTest {
         testDriver = new TopologyTestDriver(topology, properties);
 
         // Create the test input and output topics
-        inputTopic = testDriver.createInputTopic("topic1", Serdes.String().serializer(), Serdes.String().serializer());
+        inputTopic = testDriver.createInputTopic("foo_", Serdes.String().serializer(), Serdes.String().serializer());
         outputTopic = testDriver.createOutputTopic("outputTopic", Serdes.String().deserializer(), Serdes.String().deserializer());
     }
 
@@ -49,7 +49,7 @@ public class EventStoreAppTest {
         inputTopic.pipeInput("key1", "{\"key\":\"key1\",\"type\":\"type1\",\"body\":\"body1\",\"version\":1}");
 
         // Read the output record from the output topic
-        KeyValueStore<String, EventStore.StoreEvent> store = testDriver.getKeyValueStore("store1");
+        KeyValueStore<String, EventStore.StoreEvent> store = testDriver.getKeyValueStore("store_foo_0");
         EventStore.StoreEvent event = store.get("key1");
 
         // Verify the processed event
